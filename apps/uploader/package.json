@@ -1,0 +1,12 @@
+{
+    "name": "@mercury/uploader",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "bin": {
+        "push-build": "./bin/push-build"
+    },
+    "scripts": {
+        "push-build": "./bin/push-build"
+    }
+}

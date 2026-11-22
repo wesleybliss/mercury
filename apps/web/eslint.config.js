@@ -33,6 +33,7 @@ export default defineConfig(
             'coverage/**',
             'next-env.d.ts',
             'src/components/ui/**',
+            'scripts/**',
             '**/node_modules/**',
         ],
     },

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve monorepo root (apps/uploader/bin -> ../../..)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+load_env_file() {
+    local file_path="$1"
+    [[ -f "$file_path" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip CR, trim leading/trailing whitespace
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" != *=* ]] && continue
+
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        if [[ ${#value} -ge 2 ]]; then
+            local first="${value:0:1}"
+            local last="${value: -1}"
+            if [[ ( "$first" == '"' && "$last" == '"' ) || ( "$first" == "'" && "$last" == "'" ) ]]; then
+                value="${value:1:-1}"
+            fi
+        fi
+
+        # Do not override variables already set in the environment
+        if [[ -z "${!key+x}" ]]; then
+            export "$key=$value"
+        fi
+    done < "$file_path"
+}
+
+load_env_file "$ROOT_DIR/.env"
+load_env_file "$ROOT_DIR/.env.local"
+
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "error: required command not found: $1" >&2
+        exit 1
+    fi
+}
+
+require_cmd jq
+require_cmd sha256sum
+require_cmd rclone
+require_cmd stat
+require_cmd mktemp
+
+: "${R2_ENDPOINT:?R2_ENDPOINT is not set (check $ROOT_DIR/.env)}"
+: "${R2_BUCKET:?R2_BUCKET is not set (check $ROOT_DIR/.env)}"
+: "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is not set (check $ROOT_DIR/.env)}"
+: "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is not set (check $ROOT_DIR/.env)}"
+
+# Normalize endpoint: strip trailing slash and optional /<bucket> suffix
+ENDPOINT="${R2_ENDPOINT%/}"
+if [[ "$ENDPOINT" == */"$R2_BUCKET" ]]; then
+    ENDPOINT="${ENDPOINT%/"$R2_BUCKET"}"
+fi
+
+# Configure an ephemeral rclone remote named "r2" from env (no rclone.conf needed)
+export RCLONE_CONFIG_R2_TYPE=s3
+export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+export RCLONE_CONFIG_R2_ENDPOINT="$ENDPOINT"
+export RCLONE_CONFIG_R2_REGION=auto
+export RCLONE_CONFIG_R2_FORCE_PATH_STYLE=true
+export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+
+APK_PATH="${1:?Usage: push-build <path-to-apk> [app-name] [notes]}"
+APP_NAME="${2:-$(basename "$PWD")}"
+NOTES="${3:-$(git -C "$PWD" log -1 --pretty=%s 2>/dev/null || echo "Manual build")}"
+
+if [[ ! -f "$APK_PATH" ]]; then
+    echo "error: APK not found: $APK_PATH" >&2
+    exit 1
+fi
+
+BUCKET="r2:${R2_BUCKET}"
+TS="$(date -u +%Y%m%d-%H%M)"
+DIR="${APP_NAME}/${TS}"
+SHA256="$(sha256sum "$APK_PATH" | awk '{print $1}')"
+SIZE="$(stat -c%s "$APK_PATH")"
+BRANCH="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "none")"
+COMMIT="$(git -C "$PWD" rev-parse --short HEAD 2>/dev/null || echo "none")"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# 1. Create manifest.json
+jq -n \
+    --arg id "${APP_NAME}-${TS}" \
+    --arg app "$APP_NAME" \
+    --arg ts "$TS" \
+    --arg branch "$BRANCH" \
+    --arg commit "$COMMIT" \
+    --arg notes "$NOTES" \
+    --arg sha256 "$SHA256" \
+    --arg apk_key "${DIR}/app.apk" \
+    --argjson size "$SIZE" \
+    '{id:$id, app:$app, timestamp:$ts, branch:$branch, commit:$commit, notes:$notes, sha256:$sha256, apkKey:$apk_key, sizeBytes:$size}' \
+    > "$TMP_DIR/manifest.json"
+
+# 2. Upload APK and manifest
+rclone copyto "$APK_PATH" "${BUCKET}/${DIR}/app.apk" --progress --s3-upload-concurrency 4
+rclone copyto "$TMP_DIR/manifest.json" "${BUCKET}/${DIR}/manifest.json"
+
+# 3. Prepend to root index.json (keep latest 50)
+# rclone can exit 0 for a missing remote object without creating a local file
+rclone copyto "${BUCKET}/index.json" "$TMP_DIR/index.json" 2>/dev/null || true
+if [[ ! -f "$TMP_DIR/index.json" ]]; then
+    echo "[]" > "$TMP_DIR/index.json"
+fi
+jq --slurpfile new "$TMP_DIR/manifest.json" '($new + .) | .[0:50]' "$TMP_DIR/index.json" > "$TMP_DIR/index_new.json"
+rclone copyto "$TMP_DIR/index_new.json" "${BUCKET}/index.json"
+
+echo "Uploaded ${DIR} (SHA256: ${SHA256:0:12}...)"
