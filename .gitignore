@@ -30,3 +30,4 @@ next-env.d.ts
 local.properties
 *.iml
 .idea/
+.env*

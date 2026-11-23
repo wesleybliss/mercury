@@ -14,20 +14,31 @@ function getR2Bucket(): string {
     return bucket
 }
 
+/** Strip trailing slash and optional /<bucket> suffix (same as push-build). */
+function normalizeR2Endpoint(rawEndpoint: string, bucket: string): string {
+    let endpoint = rawEndpoint.trim().replace(/\/+$/, '')
+    const bucketSuffix = `/${bucket}`
+    if (endpoint.endsWith(bucketSuffix)) {
+        endpoint = endpoint.slice(0, -bucketSuffix.length)
+    }
+    return endpoint
+}
+
 function getR2Client(): S3Client {
     if (cachedClient) return cachedClient
     
-    const endpoint = process.env.R2_ENDPOINT?.trim()
+    const rawEndpoint = process.env.R2_ENDPOINT?.trim()
     const accessKeyId = process.env.R2_ACCESS_KEY_ID?.trim()
     const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY?.trim()
+    const bucket = getR2Bucket()
     
-    if (!endpoint || !accessKeyId || !secretAccessKey) {
+    if (!rawEndpoint || !accessKeyId || !secretAccessKey) {
         throw new Error('R2 credentials are not configured')
     }
     
     cachedClient = new S3Client({
         region: 'auto',
-        endpoint,
+        endpoint: normalizeR2Endpoint(rawEndpoint, bucket),
         forcePathStyle: true,
         credentials: {
             accessKeyId,

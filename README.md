@@ -6,7 +6,7 @@ Shared config lives in the repo-root [`.env`](.env) / [`.env.sample`](.env.sampl
 
 ## Uploading an APK
 
-Requires `rclone`, `jq`, and write-capable `R2_*` credentials in the root `.env`.
+Requires `rclone`, `jq`, `curl`, write-capable `R2_*` credentials, and `PBSB_*` credentials in the root `.env`.
 
 ```bash
 pnpm push-build <path-to-apk> [app-name] [notes]
@@ -26,4 +26,4 @@ Example:
 pnpm push-build ./app/build/outputs/apk/debug/app-debug.apk my-app "fix login crash"
 ```
 
-This uploads `app.apk` + `manifest.json` to R2 and prepends the build to root `index.json` (keeps the latest 50).
+This uploads `app.apk` + `manifest.json` to R2, prepends the build to root `index.json`, prunes older builds from R2 so only the latest 10 builds are kept (override with `MAX_BUILDS`), and pings your phone via PBSB (`PBSB_BASE_URL` + `PBSB_API_KEY`; topic defaults to `general`, override with `PBSB_TOPIC`).

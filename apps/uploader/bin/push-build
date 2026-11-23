@@ -54,11 +54,14 @@ require_cmd sha256sum
 require_cmd rclone
 require_cmd stat
 require_cmd mktemp
+require_cmd curl
 
 : "${R2_ENDPOINT:?R2_ENDPOINT is not set (check $ROOT_DIR/.env)}"
 : "${R2_BUCKET:?R2_BUCKET is not set (check $ROOT_DIR/.env)}"
 : "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is not set (check $ROOT_DIR/.env)}"
 : "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is not set (check $ROOT_DIR/.env)}"
+: "${PBSB_BASE_URL:?PBSB_BASE_URL is not set (check $ROOT_DIR/.env)}"
+: "${PBSB_API_KEY:?PBSB_API_KEY is not set (check $ROOT_DIR/.env)}"
 
 # Normalize endpoint: strip trailing slash and optional /<bucket> suffix
 ENDPOINT="${R2_ENDPOINT%/}"
@@ -79,9 +82,15 @@ export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 APK_PATH="${1:?Usage: push-build <path-to-apk> [app-name] [notes]}"
 APP_NAME="${2:-$(basename "$PWD")}"
 NOTES="${3:-$(git -C "$PWD" log -1 --pretty=%s 2>/dev/null || echo "Manual build")}"
+MAX_BUILDS="${MAX_BUILDS:-10}"
 
 if [[ ! -f "$APK_PATH" ]]; then
     echo "error: APK not found: $APK_PATH" >&2
+    exit 1
+fi
+
+if [[ ! "$MAX_BUILDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: MAX_BUILDS must be a positive integer (got: $MAX_BUILDS)" >&2
     exit 1
 fi
 
@@ -114,13 +123,72 @@ jq -n \
 rclone copyto "$APK_PATH" "${BUCKET}/${DIR}/app.apk" --progress --s3-upload-concurrency 4
 rclone copyto "$TMP_DIR/manifest.json" "${BUCKET}/${DIR}/manifest.json"
 
-# 3. Prepend to root index.json (keep latest 50)
+# 3. Prepend to root index.json (keep latest MAX_BUILDS)
 # rclone can exit 0 for a missing remote object without creating a local file
 rclone copyto "${BUCKET}/index.json" "$TMP_DIR/index.json" 2>/dev/null || true
 if [[ ! -f "$TMP_DIR/index.json" ]]; then
     echo "[]" > "$TMP_DIR/index.json"
 fi
-jq --slurpfile new "$TMP_DIR/manifest.json" '($new + .) | .[0:50]' "$TMP_DIR/index.json" > "$TMP_DIR/index_new.json"
+jq \
+    --slurpfile new "$TMP_DIR/manifest.json" \
+    --argjson max "$MAX_BUILDS" \
+    '($new + [.[] | select(.id != $new[0].id and .apkKey != $new[0].apkKey)]) | .[0:$max]' \
+    "$TMP_DIR/index.json" > "$TMP_DIR/index_new.json"
 rclone copyto "$TMP_DIR/index_new.json" "${BUCKET}/index.json"
 
+# 4. Prune old/orphaned builds beyond the kept index entries
+rclone lsf -R --files-only "${BUCKET}" > "$TMP_DIR/remote_files.txt"
+jq -r -R \
+    --slurpfile kept "$TMP_DIR/index_new.json" \
+    --arg current_dir "$DIR" \
+    '
+    def parent_dir: sub("/[^/]+$"; "");
+    ($kept[0] | map(.apkKey | parent_dir) + [$current_dir] | unique | map({(.): true}) | add) as $kept_dirs
+    | ($kept[0] | map(.apkKey) | unique | map({(.): true}) | add) as $kept_keys
+    | select(test("^.+/(manifest\\.json|[^/]+\\.apk)$"))
+    | select(($kept_dirs[parent_dir] // false) | not)
+    | select(($kept_keys[.] // false) | not)
+    ' "$TMP_DIR/remote_files.txt" > "$TMP_DIR/prune_files.txt"
+
+PRUNED_COUNT=0
+if [[ -s "$TMP_DIR/prune_files.txt" ]]; then
+    PRUNED_COUNT="$(jq -R -s 'split("\n") | map(select(length > 0) | sub("/[^/]+$"; "")) | unique | length' "$TMP_DIR/prune_files.txt")"
+    rclone delete "${BUCKET}" --files-from-raw "$TMP_DIR/prune_files.txt"
+fi
+
 echo "Uploaded ${DIR} (SHA256: ${SHA256:0:12}...)"
+if (( PRUNED_COUNT > 0 )); then
+    echo "Pruned ${PRUNED_COUNT} old build(s) (keeping latest ${MAX_BUILDS})"
+fi
+
+# 5. Ping phone via PBSB
+PBSB_TOPIC="${PBSB_TOPIC:-general}"
+PBSB_BASE="${PBSB_BASE_URL%/}"
+NOTIFY_URL="${PBSB_BASE}/api/notify/${PBSB_TOPIC}"
+NOTIFY_BODY="$(jq -n \
+    --arg app "$APP_NAME" \
+    --arg notes "$NOTES" \
+    --arg branch "$BRANCH" \
+    --arg commit "$COMMIT" \
+    --arg clickUrl "${AUTH_URL:-}" \
+    '
+    {
+      title: ("Mercury: " + $app + " build ready"),
+      body: ($notes + " (" + $branch + "@" + $commit + ")"),
+      priority: 4,
+      tags: ["mercury", "build"]
+    }
+    + (if $clickUrl == "" then {} else {clickUrl: $clickUrl} end)
+    ')"
+
+HTTP_CODE="$(curl -sS -o "$TMP_DIR/pbsb_response.json" -w '%{http_code}' \
+    -X POST "$NOTIFY_URL" \
+    -H "Authorization: Bearer ${PBSB_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -d "$NOTIFY_BODY")"
+
+if [[ "$HTTP_CODE" != 201 && "$HTTP_CODE" != 200 ]]; then
+    echo "error: PBSB notify failed (HTTP ${HTTP_CODE}): $(cat "$TMP_DIR/pbsb_response.json" 2>/dev/null || true)" >&2
+    exit 1
+fi
+echo "Notified PBSB topic '${PBSB_TOPIC}'"
