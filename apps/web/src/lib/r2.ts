@@ -1,10 +1,16 @@
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import {
+    DeleteObjectCommand,
+    GetObjectCommand,
+    PutObjectCommand,
+    S3Client,
+} from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
 import type { BuildManifest } from '@/types/build'
 
 const APK_CONTENT_TYPE = 'application/vnd.android.package-archive'
 const PRESIGNED_URL_TTL_SECONDS = 5 * 60
+const INDEX_KEY = 'index.json'
 
 let cachedClient: S3Client | null = null
 
@@ -83,7 +89,7 @@ export async function getBuildsIndex(): Promise<BuildManifest[]> {
         const response = await client.send(
             new GetObjectCommand({
                 Bucket: bucket,
-                Key: 'index.json',
+                Key: INDEX_KEY,
             }),
         )
         
@@ -98,6 +104,59 @@ export async function getBuildsIndex(): Promise<BuildManifest[]> {
         if (isNoSuchKeyError(error)) return []
         throw error
     }
+}
+
+async function putBuildsIndex(builds: BuildManifest[]): Promise<void> {
+    const client = getR2Client()
+    const bucket = getR2Bucket()
+    
+    await client.send(
+        new PutObjectCommand({
+            Bucket: bucket,
+            Key: INDEX_KEY,
+            Body: JSON.stringify(builds),
+            ContentType: 'application/json',
+        }),
+    )
+}
+
+async function deleteObjectIfExists(key: string): Promise<void> {
+    const client = getR2Client()
+    const bucket = getR2Bucket()
+    
+    try {
+        await client.send(
+            new DeleteObjectCommand({
+                Bucket: bucket,
+                Key: key,
+            }),
+        )
+    } catch (error) {
+        if (isNoSuchKeyError(error)) return
+        throw error
+    }
+}
+
+function manifestKeyFromApkKey(apkKey: string): string | null {
+    const slash = apkKey.lastIndexOf('/')
+    if (slash <= 0) return null
+    return `${apkKey.slice(0, slash)}/manifest.json`
+}
+
+/** Remove a build from index.json and delete its APK + manifest from R2. */
+export async function deleteBuild(id: string): Promise<'deleted' | 'not_found'> {
+    const builds = await getBuildsIndex()
+    const index = builds.findIndex(build => build.id === id)
+    if (index < 0) return 'not_found'
+    
+    const [removed] = builds.splice(index, 1)
+    await putBuildsIndex(builds)
+    
+    await deleteObjectIfExists(removed.apkKey)
+    const manifestKey = manifestKeyFromApkKey(removed.apkKey)
+    if (manifestKey) await deleteObjectIfExists(manifestKey)
+    
+    return 'deleted'
 }
 
 export async function getBuildsSnapshot(): Promise<{

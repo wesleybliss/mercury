@@ -1,6 +1,6 @@
 'use client'
 
-import { Check, Clock, Copy, Download, GitBranch, HardDrive } from 'lucide-react'
+import { Check, Clock, Copy, Download, GitBranch, HardDrive, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -18,10 +18,12 @@ interface BuildCardProps {
     build: BuildManifest
     isLatest?: boolean
     nowMs: number
+    onDeleted?: (id: string) => void
 }
 
-export function BuildCard({ build, isLatest = false, nowMs }: BuildCardProps) {
+export function BuildCard({ build, isLatest = false, nowMs, onDeleted }: BuildCardProps) {
     const [copied, setCopied] = useState(false)
+    const [isDeleting, setIsDeleting] = useState(false)
     
     const downloadHref = `/api/builds/download?key=${encodeURIComponent(build.apkKey)}&redirect=1`
     const relativeTime = formatRelativeTime(build.timestamp, nowMs)
@@ -34,6 +36,31 @@ export function BuildCard({ build, isLatest = false, nowMs }: BuildCardProps) {
             window.setTimeout(() => setCopied(false), 2000)
         } catch {
             // Clipboard access may be blocked in insecure contexts
+        }
+    }
+    
+    async function handleDelete() {
+        const label = `${build.app} (${build.branch}@${build.commit})`
+        if (!window.confirm(`Delete build ${label}? This cannot be undone.`)) return
+        
+        setIsDeleting(true)
+        try {
+            const response = await fetch(
+                `/api/builds?id=${encodeURIComponent(build.id)}`,
+                { method: 'DELETE', cache: 'no-store' },
+            )
+            if (response.status === 401) {
+                window.location.reload()
+                return
+            }
+            if (!response.ok) {
+                throw new Error('Failed to delete build')
+            }
+            onDeleted?.(build.id)
+        } catch {
+            window.alert('Could not delete this build. Try again.')
+        } finally {
+            setIsDeleting(false)
         }
     }
     
@@ -124,14 +151,29 @@ export function BuildCard({ build, isLatest = false, nowMs }: BuildCardProps) {
                     {absoluteTime}
                 </span>
                 
-                <Button
-                    render={<a href={downloadHref} />}
-                    nativeButton={false}
-                    className="w-full sm:ml-auto sm:w-auto"
-                >
-                    <Download className="size-4" />
-                    Download APK
-                </Button>
+                <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">
+                    <Button
+                        type="button"
+                        variant="destructive"
+                        size="icon-sm"
+                        onClick={handleDelete}
+                        disabled={isDeleting}
+                        aria-label={`Delete build ${build.app}`}
+                        className="shrink-0"
+                    >
+                        <Trash2 className="size-4" />
+                    </Button>
+                    
+                    <Button
+                        size="sm"
+                        render={<a href={downloadHref} />}
+                        nativeButton={false}
+                        className="min-w-0 flex-1 sm:flex-none"
+                    >
+                        <Download className="size-4" />
+                        Download APK
+                    </Button>
+                </div>
             </CardFooter>
         </Card>
     )

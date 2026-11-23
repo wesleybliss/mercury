@@ -243,6 +243,9 @@ export function BuildsDashboard({
                                 build={build}
                                 isLatest={latestIdByApp.get(build.app) === build.id}
                                 nowMs={nowMs}
+                                onDeleted={id => {
+                                    setBuilds(current => current.filter(item => item.id !== id))
+                                }}
                             />
                         ))}
                     </div>
